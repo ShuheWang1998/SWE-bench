@@ -4,6 +4,5 @@ PORT="40220"
 
 
 
-bash distributed/serve_model.sh \
-    ${MODEL_PATH} \
-    ${HOST} ${PORT}
+python -m distributed.check_connection \
+  --base_url http://${HOST}:${PORT}/v1 --model Qwen3.5-9B

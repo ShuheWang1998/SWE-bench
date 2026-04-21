@@ -134,7 +134,7 @@ class GenerationConfig:
     repeat_stop_unique: int = 10
     request_timeout: float = 600.0
     chat: bool = False
-    context_safety_margin: int = 8
+    context_safety_margin: int = 32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -213,11 +213,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--context_safety_margin",
         type=int,
-        default=8,
+        default=32,
         help=(
             "Tokens reserved at the tail of the context window when "
-            "computing the dynamic max_tokens (covers tokenizer "
-            "off-by-one, chat-template overhead, etc.)."
+            "computing the dynamic max_tokens. Chat-completion requests "
+            "already count chat-template tokens on the client side, so "
+            "this margin only needs to cover minor tokenizer / server "
+            "off-by-one quirks; 32 is conservative."
         ),
     )
     parser.add_argument(
@@ -364,19 +366,25 @@ def query_server_max_model_len(client: openai.OpenAI, model: str) -> int | None:
 
 
 class PromptCounter:
-    """Counts tokens for a prompt, with a chars/4 fallback.
+    """Counts tokens **the same way the server will count them**.
 
-    We try, in order:
-      1. ``transformers.AutoTokenizer`` loaded from ``preferred`` then any
-         fallback candidate (model path, HF id, ...).
-      2. ``tiktoken`` (only really useful if the user points at a
-         GPT-shaped tokenizer).
-      3. ``len(text) // 4`` as a last resort (logs a warning once).
+    The match-the-server detail matters: vLLM rejects any request where
+    ``server_prompt_tokens + max_tokens > max_model_len``, and for a
+    chat-completions request ``server_prompt_tokens`` is measured *after*
+    applying the model's chat template (which adds ``<|im_start|>`` /
+    ``<|im_end|>`` markers, role names, and a trailing generation prompt).
+
+    - ``chat=True``  -> count ``apply_chat_template(..., add_generation_prompt=True)``
+    - ``chat=False`` -> count raw text the way the completions endpoint sees
+      it (``add_special_tokens=True`` matches vLLM's default).
+
+    When no tokenizer is available we fall back to a chars/4 heuristic.
     """
 
-    def __init__(self, candidates: Iterable[str]) -> None:
+    def __init__(self, candidates: Iterable[str], chat: bool) -> None:
         self._tokenizer = None
         self._source = None
+        self._chat = chat
         tried: list[str] = []
         for cand in candidates:
             if not cand:
@@ -389,7 +397,11 @@ class PromptCounter:
                     cand, trust_remote_code=True
                 )
                 self._source = cand
-                logger.info("Counting prompt tokens with tokenizer '%s'.", cand)
+                logger.info(
+                    "Counting prompt tokens with tokenizer '%s' (chat=%s).",
+                    cand,
+                    chat,
+                )
                 return
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Tokenizer '%s' not usable: %s", cand, exc)
@@ -400,10 +412,37 @@ class PromptCounter:
             ", ".join(tried) or "<none>",
         )
 
-    def __call__(self, text: str) -> int:
-        if self._tokenizer is not None:
-            return len(self._tokenizer.encode(text, add_special_tokens=False))
-        return max(1, len(text) // 4)
+    def count_messages(self, messages: list[dict[str, str]]) -> int:
+        """Count tokens for a chat request, after chat-template expansion."""
+        if self._tokenizer is None:
+            total_chars = sum(len(m.get("content") or "") for m in messages)
+            return max(1, total_chars // 4)
+        try:
+            ids = self._tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=True
+            )
+            return len(ids)
+        except Exception as exc:  # noqa: BLE001
+            # Not every tokenizer has a chat template. Add a conservative
+            # estimate of template overhead (~16 tokens) on top of the raw
+            # content count so we still don't under-estimate.
+            logger.debug(
+                "apply_chat_template failed (%s); estimating overhead.", exc
+            )
+            raw = sum(
+                len(self._tokenizer.encode(m.get("content") or "",
+                                           add_special_tokens=False))
+                for m in messages
+            )
+            return raw + 16
+
+    def count_text(self, text: str) -> int:
+        """Count tokens for a completions request."""
+        if self._tokenizer is None:
+            return max(1, len(text) // 4)
+        # Match vLLM's default for /v1/completions, which does add special
+        # tokens unless the client explicitly disables them.
+        return len(self._tokenizer.encode(text, add_special_tokens=True))
 
     @property
     def exact(self) -> bool:
@@ -518,6 +557,26 @@ def resolve_max_tokens(
     return remaining
 
 
+def build_messages(prompt: str, row: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """Build the OpenAI ``messages`` payload for a chat-completions request.
+
+    We deliberately do **not** try to split ``prompt`` into system/user
+    halves on the first newline (the old behaviour of ``run_api.py`` for
+    OpenAI); that split is brittle and can corrupt multi-line system
+    prompts. Upstream ``run_llama.py`` doesn't split either — it just
+    feeds the whole formatted prompt to the model. We do the same, with
+    one exception: if the dataset row explicitly carries a
+    ``system_prompt`` column we honour it.
+    """
+    messages: list[dict[str, str]] = []
+    if row is not None:
+        sys_prompt = row.get("system_prompt")
+        if isinstance(sys_prompt, str) and sys_prompt.strip():
+            messages.append({"role": "system", "content": sys_prompt})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
 @retry(
     wait=wait_random_exponential(min=2, max=60),
     stop=stop_after_attempt(5),
@@ -530,6 +589,7 @@ def _remote_generate(
     prompt: str,
     cfg: GenerationConfig,
     max_tokens: int,
+    messages: list[dict[str, str]] | None = None,
 ) -> str:
     kwargs: dict[str, Any] = {
         "model": model,
@@ -541,18 +601,8 @@ def _remote_generate(
         kwargs["stop"] = list(cfg.stop)
 
     if cfg.chat:
-        # The "system" vs "user" split mimics what run_api.py does for OpenAI
-        # when a prompt starts with a system line. Fall back to a single user
-        # turn when the prompt does not have a clear split.
-        if "\n" in prompt:
-            system_msg, user_msg = prompt.split("\n", 1)
-        else:
-            system_msg, user_msg = "", prompt
-        messages = []
-        if system_msg:
-            messages.append({"role": "system", "content": system_msg})
-        messages.append({"role": "user", "content": user_msg})
-        response = client.chat.completions.create(messages=messages, **kwargs)
+        msgs = messages if messages is not None else build_messages(prompt)
+        response = client.chat.completions.create(messages=msgs, **kwargs)
         return response.choices[0].message.content or ""
     else:
         response = client.completions.create(prompt=prompt, **kwargs)
@@ -646,6 +696,7 @@ def run(args: argparse.Namespace) -> int:
 
     counter = PromptCounter(
         candidates=[args.tokenizer, args.model_name_or_path],
+        chat=cfg.chat,
     )
 
     output_path = output_file_for(args)
@@ -667,7 +718,14 @@ def run(args: argparse.Namespace) -> int:
             instance_id = row["instance_id"]
             prompt = row["text"]
 
-            prompt_tokens = counter(prompt)
+            # Count prompt tokens exactly the way the server will see them.
+            if cfg.chat:
+                messages = build_messages(prompt, row)
+                prompt_tokens = counter.count_messages(messages)
+            else:
+                messages = None
+                prompt_tokens = counter.count_text(prompt)
+
             max_tokens = resolve_max_tokens(cfg, prompt_tokens, effective_max_len)
             if max_tokens is None:
                 skipped_too_long += 1
@@ -689,6 +747,7 @@ def run(args: argparse.Namespace) -> int:
                     prompt,
                     cfg,
                     max_tokens=max_tokens,
+                    messages=messages,
                 )
             except Exception as exc:
                 consecutive_failures += 1

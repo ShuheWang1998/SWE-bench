@@ -25,6 +25,39 @@ OUTPUT_DIR="/home/wangshuhe/results/swe_qwen35_9b_outputs"
 TOKENIZER="/mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B"
 MAX_NEW_TOKENS="0"
 
+# --- Tokenizer fallback ----------------------------------------------------
+# Some CPU hosts cannot see the full GPU-side model directory (e.g. only
+# part of the Lustre tree is mounted). If the primary TOKENIZER path is
+# not a readable directory, transparently fall back to a small ~22 MB
+# tokenizer-only snapshot that we ship inside the repo.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [ ! -d "${TOKENIZER}" ] || [ ! -f "${TOKENIZER}/tokenizer.json" ]; then
+    REPO_ASSET_TAR="${REPO_ROOT}/distributed/assets/qwen35_9b_tokenizer.tar.gz"
+    LOCAL_TOK_DIR="${HOME}/.cache/swebench-tokenizer-Qwen3.5-9B"
+    if [ -f "${REPO_ASSET_TAR}" ]; then
+        if [ ! -f "${LOCAL_TOK_DIR}/tokenizer.json" ]; then
+            echo "[run_inference.sh] Primary tokenizer path not readable:" >&2
+            echo "[run_inference.sh]   '${TOKENIZER}'" >&2
+            echo "[run_inference.sh] Extracting repo-shipped tokenizer to" >&2
+            echo "[run_inference.sh]   '${LOCAL_TOK_DIR}'" >&2
+            mkdir -p "${LOCAL_TOK_DIR}"
+            tar -xzf "${REPO_ASSET_TAR}" -C "${LOCAL_TOK_DIR}" --strip-components=1
+        fi
+        TOKENIZER="${LOCAL_TOK_DIR}"
+    else
+        echo "[run_inference.sh] WARNING: tokenizer path '${TOKENIZER}' is" >&2
+        echo "[run_inference.sh] not a directory and no repo fallback was" >&2
+        echo "[run_inference.sh] found at ${REPO_ASSET_TAR}." >&2
+        echo "[run_inference.sh] Run the GPU-side helper to generate one:" >&2
+        echo "[run_inference.sh]   bash distributed/package_tokenizer.sh \\" >&2
+        echo "[run_inference.sh]        <gpu_path_to_model_dir> \\" >&2
+        echo "[run_inference.sh]        distributed/assets/qwen35_9b_tokenizer.tar.gz" >&2
+        echo "[run_inference.sh] Or pass --allow_heuristic_tokenizer to this script." >&2
+    fi
+fi
+# ---------------------------------------------------------------------------
+
 
 python -m distributed.run_api_remote \
     --dataset_name_or_path ${DATASET_NAME_OR_PATH} --split ${SPLIT} \

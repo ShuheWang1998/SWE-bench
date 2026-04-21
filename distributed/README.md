@@ -183,21 +183,65 @@ pip install -e ".[datasets]"           # for dataset creation (tokenizers, etc.)
 pip install -r distributed/requirements-cpu.txt
 ```
 
-### 2.1 (Optional) Build the prompt dataset once
+### 2.1 (Sometimes required) Build the prompt dataset once
 
 `run_api_remote.py` — like the upstream `run_api.py` — expects each row of
-the input dataset to already contain a pre-built `text` column. If you use
-one of the HuggingFace datasets that end in `_oracle` or `_bm25_13K` you
-can skip this step. Otherwise:
+the input dataset to already contain a pre-built `text` column. The
+HuggingFace datasets that end in `_oracle` / `_bm25_13K` / `_bm25_27K` /
+etc. already have that column, so if you point the client at e.g.
+`princeton-nlp/SWE-bench_Lite_oracle` it just works and you can skip
+this step.
+
+The **base** datasets (the ones the evaluation harness consumes) do
+**not** have a `text` column — they only carry the ground truth
+(`patch`, `test_patch`, `FAIL_TO_PASS`, `PASS_TO_PASS`, …). This
+includes the popular curated subset
+[`princeton-nlp/SWE-bench_Verified`](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified),
+for which there is no `_oracle` variant published on the Hub. For
+those you have to generate a prompt dataset locally with the official
+helper:
 
 ```bash
 python -m swebench.inference.make_datasets.create_text_dataset \
-    --dataset_name_or_path princeton-nlp/SWE-bench_Lite \
+    --dataset_name_or_path princeton-nlp/SWE-bench_Verified \
     --splits test \
     --output_dir ./datasets \
     --prompt_style style-3 \
-    --file_source oracle
+    --file_source oracle \
+    --validation_ratio 0
 ```
+
+That writes a HuggingFace `save_to_disk` directory at
+
+```
+./datasets/SWE-bench_Verified__style-3__fs-oracle/
+```
+
+which is the path you hand to `run_api_remote.py` via
+`--dataset_name_or_path`. There's a wrapper script at
+[`scripts/make_verified_oracle.sh`](../scripts/make_verified_oracle.sh)
+that does the above for you with sensible defaults; point
+`SOURCE_DATASET` at any base SWE-bench variant:
+
+```bash
+bash scripts/make_verified_oracle.sh                             # Verified
+SOURCE_DATASET=princeton-nlp/SWE-bench_Lite \
+    bash scripts/make_verified_oracle.sh                         # Lite
+SOURCE_DATASET=princeton-nlp/SWE-bench \
+    bash scripts/make_verified_oracle.sh                         # full 2.2k
+```
+
+Two things to keep straight for Verified specifically:
+
+1. **Inference** uses the *generated* on-disk path
+   (`./datasets/SWE-bench_Verified__style-3__fs-oracle`) because that's
+   where the `text` column lives.
+2. **Evaluation** uses the *original* Verified dataset name
+   (`princeton-nlp/SWE-bench_Verified`) because the harness reads repo,
+   base commit, and `FAIL_TO_PASS` / `PASS_TO_PASS` from there.
+   `scripts/run_evaluation.sh` accepts the two as separate environment
+   variables (`INFERENCE_DATASET` and `DATASET_NAME`) precisely because
+   they must differ on Verified — see §2.3.
 
 ### 2.2 Produce `predictions.jsonl` via the remote server
 

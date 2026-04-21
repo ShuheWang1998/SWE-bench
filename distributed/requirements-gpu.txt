@@ -1,0 +1,21 @@
+# GPU-side requirements for distributed SWE-bench inference.
+#
+# Installs vLLM (which pulls in torch / xformers), plus the HuggingFace
+# helpers needed to load the served model's tokenizer/config.
+#
+# We intentionally do NOT install the full SWE-bench package here — the GPU
+# machine just hosts the model; all orchestration happens on the CPU box.
+#
+# Qwen3.5 requires a recent vLLM (>= 0.11) that registers the
+# `Qwen3_5ForConditionalGeneration` architecture. Adjust the pin if your
+# cluster ships an older release.
+
+vllm>=0.11.0
+transformers>=4.46.0
+accelerate>=0.34.0
+sentencepiece
+protobuf
+
+# Optional but highly recommended — speeds up attention on recent GPUs.
+# Comment out if your environment cannot build it.
+# flash-attn>=2.6.0

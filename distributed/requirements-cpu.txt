@@ -1,0 +1,14 @@
+# CPU-side requirements for distributed SWE-bench inference.
+#
+# Installed ON TOP OF the main swebench install, e.g.:
+#     pip install -e .
+#     pip install -e ".[datasets]"
+#     pip install -r distributed/requirements-cpu.txt
+#
+# No torch / CUDA here — the CPU machine only talks HTTP to the GPU server
+# and runs ``swebench.harness.run_evaluation``.
+
+openai>=1.30.0
+tenacity
+tqdm
+numpy

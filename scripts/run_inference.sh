@@ -33,18 +33,22 @@ OUTPUT_DIR="/home/wangshuhe/results/swe_qwen35_9b_outputs"
 TOKENIZER="/mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B"
 # Upstream swebench.inference.run_llama.py uses 200 as the default output
 # budget. This is plenty for SWE-bench target patches (typically 50-500
-# tokens) and prevents pathological runaway generations from pinning a
-# replica for minutes. Pass ``0`` here to let the model run until it hits
-# EOS or the hard context limit (slower, but allowed).
-MAX_NEW_TOKENS="0"
-# vLLM's ``--data_parallel_size`` (on the GPU box) is the ceiling on how
-# many requests this client should have in flight at once: more doesn't
-# help, less leaves replicas idle. The server is currently tp=4 dp=2, so
-# 2 is the natural replica-matched value. vLLM's continuous batching
-# inside each replica can absorb several more in-flight requests though,
-# so we set the client slightly higher (4x replicas) to keep both boxes
-# fully pipelined without starving KV cache.
-CONCURRENCY="2"
+# tokens) and crucially prevents pathological runaway generations from
+# pinning a replica for minutes. With max_model_len=262144, passing 0
+# here means "generate up to 262k output tokens"; at ~300 tok/s a single
+# request can then block a replica for 15+ minutes, which we empirically
+# saw: rank0 generated for 5 consecutive minutes on the same request
+# without ever finishing. Leave this at 200 unless you have a *specific*
+# reason to want full-window generations (and even then, pair it with
+# --repeat_stop_window to catch degenerate repetition early).
+MAX_NEW_TOKENS="200"
+# Keep several requests in flight per replica so vLLM's internal
+# continuous batching has something to work with; if one happens to be
+# slow, the others keep the GPU busy. With 2 backends this gives each
+# replica a working set of 4, which matches the "replicas x 4" rule of
+# thumb discussed in distributed/README.md. Drop to 2 for strict 1:1
+# pairing with the replica count, or 1 for fully sequential processing.
+CONCURRENCY="8"
 
 # --- Tokenizer fallback ----------------------------------------------------
 # Some CPU hosts cannot see the full GPU-side model directory (e.g. only

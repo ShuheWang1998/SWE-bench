@@ -52,6 +52,7 @@ Minimal example
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -65,6 +66,7 @@ from typing import Any, Iterable
 import numpy as np
 from datasets import load_dataset, load_from_disk
 from tenacity import (
+    AsyncRetrying,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -285,6 +287,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="HTTP request timeout, in seconds.",
     )
     parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=8,
+        help=(
+            "Maximum number of in-flight generation requests. Sized to "
+            "the server's data-parallel replica count (vLLM's "
+            "--data_parallel_size); 1 forces sequential behavior. "
+            "Increase if you also have room in pipelined scheduling "
+            "(vLLM's continuous batching can often absorb 2-4x more) "
+            "but beware: each in-flight request reserves its own KV "
+            "cache budget, so too high a number starves throughput."
+        ),
+    )
+    parser.add_argument(
         "--chat",
         action="store_true",
         help=(
@@ -321,7 +337,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         default=None,
-        help="Process at most this many instances (debugging).",
+        help=(
+            "Process at most this many instances per invocation. NOTE: "
+            "applied AFTER the resume filter (existing instance_ids in the "
+            "output file are removed first). So re-running the same command "
+            "with --limit N will process the *next* N undone instances, "
+            "not re-process the first N. This matches upstream run_api.py."
+        ),
     )
     parser.add_argument(
         "--instance_ids",
@@ -759,6 +781,48 @@ def _remote_generate(
         return response.choices[0].text or ""
 
 
+async def _remote_generate_async(
+    client: openai.AsyncOpenAI,
+    model: str,
+    prompt: str,
+    cfg: GenerationConfig,
+    max_tokens: int,
+    messages: list[dict[str, str]] | None = None,
+) -> str:
+    """Async counterpart of :func:`_remote_generate`.
+
+    Tenacity's async retry loop requires ``AsyncRetrying`` rather than the
+    decorator; we can't put the retry decorator on an ``async def`` and
+    keep compatibility with the rest of the stack.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "temperature": cfg.temperature,
+        "top_p": cfg.top_p,
+        "max_tokens": max_tokens,
+    }
+    if cfg.stop:
+        kwargs["stop"] = list(cfg.stop)
+    msgs = messages if messages is not None else build_messages(prompt) if cfg.chat else None
+
+    async for attempt in AsyncRetrying(
+        wait=wait_random_exponential(min=2, max=60),
+        stop=stop_after_attempt(5),
+        retry=retry_if_exception_type(_RETRYABLE),
+        reraise=True,
+    ):
+        with attempt:
+            if cfg.chat:
+                response = await client.chat.completions.create(messages=msgs, **kwargs)
+                return response.choices[0].message.content or ""
+            response = await client.completions.create(prompt=prompt, **kwargs)
+            return response.choices[0].text or ""
+    # ``AsyncRetrying(..., reraise=True)`` guarantees we never fall through
+    # without either returning or raising, but type-checkers don't know
+    # that. The sentinel below is unreachable at runtime.
+    raise RuntimeError("unreachable: AsyncRetrying exited without result")
+
+
 # --------------------------------------------------------------------------- #
 # Main loop                                                                   #
 # --------------------------------------------------------------------------- #
@@ -777,7 +841,10 @@ def iter_filtered_dataset(
 
     items = [row for row in items if row["instance_id"] not in existing_ids]
 
-    if "text" not in (items[0] if items else {}):
+    # Only validate the schema when there is work left to do — otherwise
+    # an empty resume run (every instance already present) would falsely
+    # complain about a missing 'text' column.
+    if items and "text" not in items[0]:
         raise ValueError(
             "The dataset must contain a 'text' column with the pre-built prompt. "
             "Either use a pre-built dataset (e.g. princeton-nlp/SWE-bench_Lite_oracle) "
@@ -875,106 +942,238 @@ def run(args: argparse.Namespace) -> int:
         logger.info("Nothing to do.")
         return 0
 
-    consecutive_failures = 0
-    skipped_too_long = 0
-    with output_path.open("a", encoding="utf-8") as fout:
-        for row in tqdm(items, desc=f"remote inference ({args.model_name_or_path})"):
-            instance_id = row["instance_id"]
-            prompt = row["text"]
+    concurrency = max(1, int(args.concurrency))
+    logger.info(
+        "Running with concurrency=%d against %s (request_timeout=%.0fs).",
+        concurrency,
+        args.base_url,
+        cfg.request_timeout,
+    )
 
-            # Count prompt tokens exactly the way the server will see them.
-            if cfg.chat:
-                messages = build_messages(prompt, row)
-                prompt_tokens = counter.count_messages(messages)
-            else:
-                messages = None
-                prompt_tokens = counter.count_text(prompt)
-
-            max_tokens = resolve_max_tokens(cfg, prompt_tokens, effective_max_len)
-            if max_tokens is None:
-                skipped_too_long += 1
-                logger.warning(
-                    "[%s] prompt uses %d tokens which leaves no room in the "
-                    "%d-token window after a %d-token safety margin; skipping.",
-                    instance_id,
-                    prompt_tokens,
-                    effective_max_len or 0,
-                    cfg.context_safety_margin,
-                )
-                continue
-
-            # Pre-flight sanity check: if ``prompt_tokens + max_tokens`` ever
-            # exceeds ``effective_max_len`` we would just hand the server a
-            # request it's guaranteed to reject with VLLMValidationError.
-            # This cannot happen with the arithmetic in ``resolve_max_tokens``
-            # above, but we assert it anyway so that if this invariant is ever
-            # broken by a future refactor the failure is loud and local
-            # instead of an opaque server-side 400.
-            if (
-                effective_max_len is not None
-                and prompt_tokens + max_tokens > effective_max_len
-            ):
-                logger.error(
-                    "[%s] BUG: prompt_tokens(%d) + max_tokens(%d) = %d > "
-                    "effective_max_len(%d). This should never happen; "
-                    "refusing to send the request.",
-                    instance_id,
-                    prompt_tokens,
-                    max_tokens,
-                    prompt_tokens + max_tokens,
-                    effective_max_len,
-                )
-                continue
-
-            start = time.time()
-            try:
-                raw = _remote_generate(
-                    client,
-                    args.model_name_or_path,
-                    prompt,
-                    cfg,
-                    max_tokens=max_tokens,
-                    messages=messages,
-                )
-            except Exception as exc:
-                consecutive_failures += 1
-                logger.error("Generation failed for %s: %s", instance_id, exc)
-                if consecutive_failures >= 5:
-                    logger.error("Aborting after 5 consecutive failures.")
-                    return 1
-                continue
-            consecutive_failures = 0
-            trimmed = truncate_on_repeat(
-                raw,
-                window=cfg.repeat_stop_window,
-                min_unique=cfg.repeat_stop_unique,
-            )
-            patch = extract_diff(trimmed)
-            payload = {
-                "instance_id": instance_id,
-                "model_name_or_path": args.model_name_or_path,
-                "full_output": trimmed,
-                "model_patch": patch,
-            }
-            fout.write(json.dumps(payload) + "\n")
-            fout.flush()
-            logger.info(
-                "[%s] prompt=%d tok, budget=%d tok, gen=%d chars in %.2fs; patch_bytes=%d",
-                instance_id,
-                prompt_tokens,
-                max_tokens,
-                len(trimmed),
-                time.time() - start,
-                len(patch or ""),
-            )
+    skipped_too_long, sent = asyncio.run(
+        _run_workers(
+            items=items,
+            args=args,
+            cfg=cfg,
+            counter=counter,
+            effective_max_len=effective_max_len,
+            output_path=output_path,
+            concurrency=concurrency,
+        )
+    )
 
     if skipped_too_long:
         logger.info(
             "Skipped %d instance(s) whose prompt exceeded the context window.",
             skipped_too_long,
         )
-    logger.info("Done. Output: %s", output_path)
+    logger.info("Done. %d prediction(s) written to %s", sent, output_path)
     return 0
+
+
+async def _run_workers(
+    items: list[dict[str, Any]],
+    args: argparse.Namespace,
+    cfg: GenerationConfig,
+    counter: PromptCounter,
+    effective_max_len: int | None,
+    output_path: Path,
+    concurrency: int,
+) -> tuple[int, int]:
+    """Process ``items`` concurrently and append predictions to disk.
+
+    Returns ``(skipped_too_long, predictions_written)``.
+    """
+    # Each in-flight request needs its own HTTP slot. We use an
+    # ``AsyncOpenAI`` client; its underlying httpx.AsyncClient pools
+    # connections for us. Size the connection pool to ``concurrency``
+    # so we neither over-allocate sockets nor serialize on a tiny pool.
+    base_url = args.base_url or os.environ.get("SWEBENCH_REMOTE_BASE_URL")
+    api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
+    import httpx  # imported locally — httpx is an openai dependency
+
+    transport = httpx.AsyncHTTPTransport(retries=0)
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=max(concurrency * 2, 16),
+            max_keepalive_connections=max(concurrency, 8),
+        ),
+        timeout=cfg.request_timeout,
+        transport=transport,
+    )
+    aclient = openai.AsyncOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        http_client=http_client,
+    )
+
+    # The writer is a single thread-safe coroutine; workers push payloads
+    # onto a queue and the writer drains them in arrival order. This keeps
+    # the file format identical (one JSON per line, flushed after each
+    # write) regardless of how many workers are running.
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    skipped_too_long = 0
+    stats = {
+        "sent": 0,
+        "failed": 0,
+        "consecutive_failures": 0,
+        "abort": False,
+        "inflight": 0,
+    }
+    stats_lock = asyncio.Lock()
+
+    sem = asyncio.Semaphore(concurrency)
+    pbar = tqdm(
+        total=len(items),
+        desc=f"remote inference ({args.model_name_or_path})",
+    )
+
+    # --- writer coroutine ---------------------------------------------------
+    async def writer() -> None:
+        # Open the file inside the coroutine so any exceptions during file
+        # open propagate to the main task (asyncio.run will show them).
+        def _fopen():
+            return output_path.open("a", encoding="utf-8", buffering=1)
+
+        loop = asyncio.get_running_loop()
+        fout = await loop.run_in_executor(None, _fopen)
+        try:
+            while True:
+                payload = await queue.get()
+                if payload is None:
+                    return
+                line = json.dumps(payload) + "\n"
+                await loop.run_in_executor(None, fout.write, line)
+                await loop.run_in_executor(None, fout.flush)
+        finally:
+            await loop.run_in_executor(None, fout.close)
+
+    writer_task = asyncio.create_task(writer(), name="predictions-writer")
+
+    # --- per-instance worker ------------------------------------------------
+    async def handle(row: dict[str, Any]) -> None:
+        nonlocal skipped_too_long
+        if stats["abort"]:
+            return
+        instance_id = row["instance_id"]
+        prompt = row["text"]
+
+        if cfg.chat:
+            messages = build_messages(prompt, row)
+            prompt_tokens = counter.count_messages(messages)
+        else:
+            messages = None
+            prompt_tokens = counter.count_text(prompt)
+
+        max_tokens = resolve_max_tokens(cfg, prompt_tokens, effective_max_len)
+        if max_tokens is None:
+            async with stats_lock:
+                skipped_too_long += 1
+            logger.warning(
+                "[%s] prompt uses %d tokens which leaves no room in the "
+                "%d-token window after a %d-token safety margin; skipping.",
+                instance_id,
+                prompt_tokens,
+                effective_max_len or 0,
+                cfg.context_safety_margin,
+            )
+            pbar.update(1)
+            return
+
+        if (
+            effective_max_len is not None
+            and prompt_tokens + max_tokens > effective_max_len
+        ):
+            logger.error(
+                "[%s] BUG: prompt_tokens(%d) + max_tokens(%d) = %d > "
+                "effective_max_len(%d). This should never happen; "
+                "refusing to send the request.",
+                instance_id,
+                prompt_tokens,
+                max_tokens,
+                prompt_tokens + max_tokens,
+                effective_max_len,
+            )
+            pbar.update(1)
+            return
+
+        start = time.time()
+        async with sem:
+            async with stats_lock:
+                stats["inflight"] += 1
+            try:
+                raw = await _remote_generate_async(
+                    aclient,
+                    args.model_name_or_path,
+                    prompt,
+                    cfg,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                )
+            except Exception as exc:  # noqa: BLE001
+                async with stats_lock:
+                    stats["failed"] += 1
+                    stats["consecutive_failures"] += 1
+                    stats["inflight"] -= 1
+                    if stats["consecutive_failures"] >= 5:
+                        stats["abort"] = True
+                logger.error("Generation failed for %s: %s", instance_id, exc)
+                pbar.update(1)
+                return
+
+        async with stats_lock:
+            stats["consecutive_failures"] = 0
+            stats["sent"] += 1
+            stats["inflight"] -= 1
+            inflight_now = stats["inflight"]
+
+        trimmed = truncate_on_repeat(
+            raw,
+            window=cfg.repeat_stop_window,
+            min_unique=cfg.repeat_stop_unique,
+        )
+        patch = extract_diff(trimmed)
+        payload = {
+            "instance_id": instance_id,
+            "model_name_or_path": args.model_name_or_path,
+            "full_output": trimmed,
+            "model_patch": patch,
+        }
+        await queue.put(payload)
+        elapsed = time.time() - start
+        pbar.update(1)
+        pbar.set_postfix_str(
+            f"inflight={inflight_now}/{concurrency}",
+            refresh=False,
+        )
+        logger.info(
+            "[%s] prompt=%d tok, budget=%d tok, gen=%d chars in %.2fs; patch_bytes=%d",
+            instance_id,
+            prompt_tokens,
+            max_tokens,
+            len(trimmed),
+            elapsed,
+            len(patch or ""),
+        )
+
+    tasks = [asyncio.create_task(handle(row), name=f"row-{i}") for i, row in enumerate(items)]
+    try:
+        await asyncio.gather(*tasks, return_exceptions=False)
+    finally:
+        pbar.close()
+        await queue.put(None)
+        await writer_task
+        await aclient.close()
+        await http_client.aclose()
+
+    if stats["abort"]:
+        logger.error(
+            "Aborted after 5 consecutive failures (sent=%d, failed=%d).",
+            stats["sent"],
+            stats["failed"],
+        )
+
+    return skipped_too_long, stats["sent"]
 
 
 def main(argv: list[str] | None = None) -> int:

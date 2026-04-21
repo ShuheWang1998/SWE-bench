@@ -176,6 +176,7 @@ python -m distributed.run_api_remote \
     --temperature 0.0 \
     --top_p 1.0 \
     --max_new_tokens 200 \
+    --concurrency 8 \
     --tokenizer /mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B
 ```
 
@@ -190,18 +191,32 @@ Arguments:
   so the request is routed correctly.
 - `--base_url` – OpenAI v1 base URL of the GPU server.
 - `--api_key` – any non-empty string (vLLM accepts `EMPTY`).
+- `--concurrency` – maximum number of in-flight generation requests
+  (default `8`). **Set this equal to the GPU server's
+  `--data_parallel_size`.** `1` reproduces the old sequential
+  behaviour; a value larger than the number of replicas just spends
+  client memory buffering requests that vLLM will queue internally.
 - `--max_new_tokens` – **upper bound** for completion length (default 200,
   matches `run_llama.py`). The client further clips this to whatever the
   context window can still spare, so the request never exceeds
   `max_model_len` and the model stops naturally on EOS / stop strings.
   Pass **`--max_new_tokens 0`** to say "let the model use everything that's
-  left in the context window."
+  left in the context window." Only recommended for debugging — a single
+  pathological generation can otherwise pin a replica for minutes.
 - `--context_safety_margin` – tokens held back from the hard ceiling when
-  computing the dynamic budget (default `8`, covers chat-template
+  computing the dynamic budget (default `32`, covers chat-template
   overhead and tokenizer off-by-one).
-- `--tokenizer` – path or HF id used to count prompt tokens. Defaults to
-  `--model_name_or_path`. Point it at the local model directory for an
-  exact count; otherwise the client falls back to a `chars/4` heuristic.
+- `--tokenizer` – path (or HF id) of the tokenizer used to count prompt
+  tokens locally. **Required** for stable runs: the client auto-aborts
+  at startup if it can't load this and `--allow_heuristic_tokenizer`
+  wasn't passed. The repo ships a 6.8 MB tarball at
+  `distributed/assets/qwen35_9b_tokenizer.tar.gz` — `scripts/run_inference.sh`
+  extracts it to `~/.cache/swebench-tokenizer-Qwen3.5-9B/` automatically
+  when the primary path isn't readable.
+- `--allow_heuristic_tokenizer` – opt into a pessimistic `chars/3` fallback
+  if no tokenizer can be loaded. Off by default: the fallback over-counts
+  by ~20% (wastes output budget) but never under-counts (never causes
+  400s), which is the opposite of the silent `chars/4` path it replaces.
 - `--max_context_tokens` – optional *user-imposed* cap on the window. Use
   this to test at a tighter budget than the server actually serves;
   prompts that don't fit are skipped instead of triggering a server-side
@@ -215,6 +230,24 @@ Arguments:
   Recommended for Qwen3.5 Instruct so that the model's chat template is
   applied; omit for base models or when your dataset already contains the
   full formatted prompt.
+
+### 2.2.1 Scaling throughput
+
+The client is async and maintains up to `--concurrency` in-flight
+requests. If your GPU server runs with `--data_parallel_size 8`, the
+benchmark below shows the speedup you should see out of the box:
+
+| Client `--concurrency` | Wall-clock for 16 instances (Qwen3.5-9B, `--max_new_tokens 200`) | Throughput |
+| ---: | ---: | ---: |
+| 1 | 23.5 s (1.47 s/it) | 0.68 req/s |
+| 8 | 3.7 s (4.33 it/s) | 4.33 req/s (**6.4×**) |
+
+Scaling past the replica count yields diminishing returns (vLLM's own
+continuous batching inside a replica is already very efficient) and
+eventually *hurts* throughput once KV-cache pressure forces evictions.
+Start at `--concurrency == --data_parallel_size` and only go higher if
+the progress bar's `inflight=N/K` indicator is consistently pinned at
+`K` and the GPUs aren't saturated.
 
 The output is a standard SWE-bench predictions JSONL with three keys per line:
 

@@ -23,7 +23,17 @@ MODEL_NAME_OR_PATH="Qwen3.5-9B"
 BASE_URL="http://localhost:40220/v1"
 OUTPUT_DIR="/home/wangshuhe/results/swe_qwen35_9b_outputs"
 TOKENIZER="/mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B"
+# Upstream swebench.inference.run_llama.py uses 200 as the default output
+# budget. This is plenty for SWE-bench target patches (typically 50-500
+# tokens) and prevents pathological runaway generations from pinning a
+# replica for minutes. Pass ``0`` here to let the model run until it hits
+# EOS or the hard context limit (slower, but allowed).
 MAX_NEW_TOKENS="0"
+# vLLM's ``--data_parallel_size`` (on the GPU box) is the ceiling on how
+# many requests this client should have in flight at once: more doesn't
+# help, less leaves replicas idle. Matching the two here gives linear
+# scaling to the replica count.
+CONCURRENCY="8"
 
 # --- Tokenizer fallback ----------------------------------------------------
 # Some CPU hosts cannot see the full GPU-side model directory (e.g. only
@@ -65,4 +75,5 @@ python -m distributed.run_api_remote \
     --base_url ${BASE_URL} --output_dir ${OUTPUT_DIR} \
     --tokenizer ${TOKENIZER} \
     --max_new_tokens ${MAX_NEW_TOKENS} \
+    --concurrency ${CONCURRENCY} \
     --chat

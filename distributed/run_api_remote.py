@@ -238,8 +238,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Path or HF id of the tokenizer used to count prompt tokens. "
-            "Defaults to --model_name_or_path. If neither is a real "
-            "tokenizer repo/path, a 'chars/4' heuristic is used instead."
+            "Defaults to --model_name_or_path. If this tokenizer can't be "
+            "loaded the client aborts — we've seen silent 'chars/4' "
+            "fallbacks lead to a 100% 400 rate against vLLM because the "
+            "crude estimate is just *below* the real token count, and the "
+            "sign error pushes every request one token past max_model_len. "
+            "Use --allow_heuristic_tokenizer to opt back into the fallback."
+        ),
+    )
+    parser.add_argument(
+        "--allow_heuristic_tokenizer",
+        action="store_true",
+        help=(
+            "If no tokenizer can be loaded, keep running with a "
+            "chars/4 (safety-inflated by 25%%) estimator instead of "
+            "aborting. Off by default because an under-counting "
+            "tokenizer produces a 100%% 400 rate against vLLM."
         ),
     )
     parser.add_argument(
@@ -378,21 +392,34 @@ class PromptCounter:
     - ``chat=False`` -> count raw text the way the completions endpoint sees
       it (``add_special_tokens=True`` matches vLLM's default).
 
-    When no tokenizer is available we fall back to a chars/4 heuristic.
+    If no tokenizer is loadable and ``allow_heuristic=True``, a
+    *pessimistic* chars/3 heuristic is used. We deliberately over-count
+    instead of under-count: an over-count loses a few free output tokens,
+    while the chars/4 under-count we used previously produced a 100%
+    400-rate against vLLM (prompt_tokens + max_tokens would land exactly
+    one token past max_model_len).
     """
 
-    def __init__(self, candidates: Iterable[str], chat: bool) -> None:
+    def __init__(
+        self,
+        candidates: Iterable[str],
+        chat: bool,
+        allow_heuristic: bool = False,
+    ) -> None:
         self._tokenizer = None
         self._source = None
         self._chat = chat
-        tried: list[str] = []
+        self._allow_heuristic = allow_heuristic
+        tried: list[tuple[str, str]] = []
         for cand in candidates:
             if not cand:
                 continue
-            tried.append(cand)
             try:
                 from transformers import AutoTokenizer  # type: ignore
-
+            except ImportError as exc:
+                tried.append((cand, f"cannot import transformers: {exc}"))
+                break
+            try:
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     cand, trust_remote_code=True
                 )
@@ -404,19 +431,32 @@ class PromptCounter:
                 )
                 return
             except Exception as exc:  # noqa: BLE001
-                logger.debug("Tokenizer '%s' not usable: %s", cand, exc)
-        logger.warning(
-            "No usable tokenizer found (tried %s); falling back to "
-            "len(text)//4 for prompt-token accounting. This is only a "
-            "rough estimate; consider passing --tokenizer.",
-            ", ".join(tried) or "<none>",
+                # Most useful debugging info is the exception *class*; the
+                # message is often generic ("Can't load tokenizer ...").
+                tried.append((cand, f"{type(exc).__name__}: {exc}"))
+
+        detail = "; ".join(f"{p!r} -> {err}" for p, err in tried) or "<no candidates>"
+        msg = (
+            "No usable tokenizer could be loaded; tried: " + detail + ". "
+            "An accurate tokenizer is required because vLLM rejects any "
+            "request where prompt_tokens + max_tokens > max_model_len, and "
+            "the chars/4 fallback under-counts by 5-10% which lands every "
+            "request one token past the limit. Fixes: (1) ensure "
+            "--tokenizer points at a directory containing tokenizer.json "
+            "(e.g. the same HF snapshot the GPU server is serving), or "
+            "(2) pip install 'transformers>=4.44' 'sentencepiece' on the "
+            "CPU node, or (3) pass --allow_heuristic_tokenizer to opt "
+            "into the (pessimistic) chars/3 estimator."
         )
+        if allow_heuristic:
+            logger.warning(msg)
+        else:
+            raise SystemExit(msg)
 
     def count_messages(self, messages: list[dict[str, str]]) -> int:
         """Count tokens for a chat request, after chat-template expansion."""
         if self._tokenizer is None:
-            total_chars = sum(len(m.get("content") or "") for m in messages)
-            return max(1, total_chars // 4)
+            return self._pessimistic_chat_count(messages)
         try:
             ids = self._tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=True
@@ -439,10 +479,25 @@ class PromptCounter:
     def count_text(self, text: str) -> int:
         """Count tokens for a completions request."""
         if self._tokenizer is None:
-            return max(1, len(text) // 4)
+            return self._pessimistic_text_count(text)
         # Match vLLM's default for /v1/completions, which does add special
         # tokens unless the client explicitly disables them.
         return len(self._tokenizer.encode(text, add_special_tokens=True))
+
+    @staticmethod
+    def _pessimistic_text_count(text: str) -> int:
+        # Subword tokenizers for English code hover around 3.3–3.8 chars
+        # per token; using /3 deliberately over-counts. Add a fixed
+        # headroom to cover chat-template markers even in completions
+        # mode (some providers still inject system/user wrappers).
+        return max(1, len(text) // 3 + 32)
+
+    @classmethod
+    def _pessimistic_chat_count(cls, messages: list[dict[str, str]]) -> int:
+        total_chars = sum(len(m.get("content") or "") for m in messages)
+        # Per-message overhead covers <|im_start|>role\n and <|im_end|>\n
+        # tokens that every chat-template emits (~4 tokens per role).
+        return max(1, total_chars // 3 + 16 + 4 * len(messages))
 
     @property
     def exact(self) -> bool:
@@ -555,6 +610,101 @@ def resolve_max_tokens(
     if cfg.max_new_tokens > 0:
         return min(cfg.max_new_tokens, remaining)
     return remaining
+
+
+def _server_tokenize(
+    client: openai.OpenAI,
+    model: str,
+    chat: bool,
+    text_or_messages: Any,
+) -> int | None:
+    """Ask the vLLM server to tokenize a payload. Returns the exact token
+    count or ``None`` if the server doesn't expose ``/tokenize``.
+
+    Uses the OpenAI client's transport so it inherits timeouts, retries,
+    and auth headers without a second HTTP client dependency.
+    """
+    body: dict[str, Any] = {"model": model}
+    if chat:
+        body["messages"] = text_or_messages
+        body["add_generation_prompt"] = True
+    else:
+        body["prompt"] = text_or_messages
+    try:
+        # The openai python client exposes a raw POST via
+        # ``client.with_raw_response.post`` only in newer versions; for
+        # portability we just use the underlying httpx client.
+        base = str(client.base_url).rstrip("/")
+        # /tokenize lives at the server root, not under /v1 — vLLM's
+        # OpenAI bridge registers it outside the versioned namespace.
+        base_root = base.rsplit("/v1", 1)[0] if base.endswith("/v1") else base
+        url = base_root + "/tokenize"
+        resp = client._client.post(url, json=body, timeout=30.0)  # type: ignore[attr-defined]
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if "count" in data and isinstance(data["count"], int):
+            return data["count"]
+        if "tokens" in data and isinstance(data["tokens"], list):
+            return len(data["tokens"])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("server /tokenize probe failed: %s", exc)
+    return None
+
+
+def _calibrate_counter_or_die(
+    counter: PromptCounter,
+    client: openai.OpenAI,
+    model: str,
+    chat: bool,
+    safety_margin: int,
+) -> None:
+    """Compare local token count to the server's, abort on mismatch.
+
+    Sends a tiny, realistic probe through both paths and verifies the
+    client's count is *at least as large as* the server's. The client
+    counting ``>=`` the server is fine (we'll just waste a few output
+    tokens); the client counting ``<`` the server is fatal (request will
+    be rejected). We only tolerate a ``safety_margin / 2`` shortfall to
+    leave a tiny cushion for tokenizer revision skew.
+    """
+    probe_msgs = [
+        {"role": "system", "content": "You are a careful code assistant."},
+        {"role": "user",
+         "content": "def add(a: int, b: int) -> int:\n    return a + b\n\n"
+                    "Write a docstring for the function above."},
+    ]
+    probe_text = probe_msgs[-1]["content"]
+
+    server = _server_tokenize(
+        client, model, chat, probe_msgs if chat else probe_text,
+    )
+    if server is None:
+        # Server doesn't expose /tokenize (non-vLLM endpoint); we can't
+        # calibrate. Accept the risk silently — it's an exact-tokenizer
+        # deployment assumption breaking, not our bug.
+        logger.info(
+            "Server has no /tokenize endpoint; skipping counter calibration."
+        )
+        return
+
+    local = counter.count_messages(probe_msgs) if chat else counter.count_text(probe_text)
+    delta = server - local  # positive means we undercounted
+    logger.info(
+        "Tokenizer calibration: local=%d, server=%d, delta=%+d (margin=%d).",
+        local, server, delta, safety_margin,
+    )
+    if delta > safety_margin // 2:
+        raise SystemExit(
+            f"Client tokenizer under-counts the server by {delta} tokens on "
+            f"a short probe (local={local}, server={server}). This will "
+            f"cause vLLM to reject most requests with 400 "
+            f"(prompt_tokens + max_tokens > max_model_len). "
+            f"Fix: pass --tokenizer pointing at the exact HF snapshot the "
+            f"GPU server is serving (it must contain tokenizer.json), or "
+            f"increase --context_safety_margin to at least {(delta + 16) * 2} "
+            f"so the budget absorbs the mismatch."
+        )
 
 
 def build_messages(prompt: str, row: dict[str, Any] | None = None) -> list[dict[str, str]]:
@@ -697,6 +847,20 @@ def run(args: argparse.Namespace) -> int:
     counter = PromptCounter(
         candidates=[args.tokenizer, args.model_name_or_path],
         chat=cfg.chat,
+        allow_heuristic=args.allow_heuristic_tokenizer,
+    )
+
+    # Calibrate the local counter against the server's own tokenizer on
+    # a synthetic short message. If they disagree by more than
+    # ``context_safety_margin / 2`` we refuse to continue, rather than
+    # emit hundreds of doomed requests: previous mis-loaded tokenizers
+    # underestimated by ~5-10% and the sign error caused a 100% 400 rate.
+    _calibrate_counter_or_die(
+        counter=counter,
+        client=client,
+        model=args.model_name_or_path,
+        chat=cfg.chat,
+        safety_margin=cfg.context_safety_margin,
     )
 
     output_path = output_file_for(args)
@@ -736,6 +900,29 @@ def run(args: argparse.Namespace) -> int:
                     prompt_tokens,
                     effective_max_len or 0,
                     cfg.context_safety_margin,
+                )
+                continue
+
+            # Pre-flight sanity check: if ``prompt_tokens + max_tokens`` ever
+            # exceeds ``effective_max_len`` we would just hand the server a
+            # request it's guaranteed to reject with VLLMValidationError.
+            # This cannot happen with the arithmetic in ``resolve_max_tokens``
+            # above, but we assert it anyway so that if this invariant is ever
+            # broken by a future refactor the failure is loud and local
+            # instead of an opaque server-side 400.
+            if (
+                effective_max_len is not None
+                and prompt_tokens + max_tokens > effective_max_len
+            ):
+                logger.error(
+                    "[%s] BUG: prompt_tokens(%d) + max_tokens(%d) = %d > "
+                    "effective_max_len(%d). This should never happen; "
+                    "refusing to send the request.",
+                    instance_id,
+                    prompt_tokens,
+                    max_tokens,
+                    prompt_tokens + max_tokens,
+                    effective_max_len,
                 )
                 continue
 

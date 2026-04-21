@@ -52,18 +52,22 @@ python -m distributed.serve_model \
     --served_model_name Qwen3.5-9B \
     --host 0.0.0.0 \
     --port 8000 \
-    --gpu_memory_utilization 0.9 \
-    --max_model_len 65536 \
-    --data_parallel_size 8
+    --gpu_memory_utilization 0.95 \
+    --max_model_len 262144 \
+    --tensor_parallel_size 4 \
+    --data_parallel_size 2
 ```
 
 > **Pick `--max_model_len` large enough for the prompts you'll send.** It
 > is the *total* window — prompt + output — that vLLM enforces, and it
 > rejects any request where `prompt_tokens + max_tokens > max_model_len`.
-> SWE-bench_Lite_oracle prompts regularly run 20k–35k tokens, so 32768 is
-> usually too small once you add generation budget. **Use 65536 for
-> Qwen3.5-9B on H100s**; the model natively supports up to 262144 and the
-> KV-cache hit is modest at DP=8.
+> SWE-bench_oracle prompts regularly run 20k–35k tokens with a long tail
+> that goes well past 100k. **The wrapper script ships with
+> `tp=4, dp=2, max_model_len=262144`** so Qwen3.5-9B on 8×H100 fits the
+> model's native 262144-token window (recovers ~7 % of instances that
+> would otherwise be skipped at 65k). If you prefer lower per-request
+> latency and don't need the huge context, drop to
+> `tp=1, dp=8, max_model_len=65536` (the upstream default).
 
 ### Choosing the parallelism strategy
 
@@ -79,9 +83,13 @@ Total GPUs consumed = `tp × dp × pp`. The wrapper refuses to launch if that
 exceeds `CUDA_VISIBLE_DEVICES` (or the system's GPU count).
 
 For `Qwen3.5-9B` (≈18 GB bf16 — fits comfortably on any H100 with room for
-KV cache) on an 8×H100 node, **`--data_parallel_size 8`** is the right
-setting. `--tensor_parallel_size 8` would additionally fail validation
-because the model's `num_key_value_heads=4` is not divisible by 8.
+KV cache) on an 8×H100 node, the two interesting points in the design
+space are **`tp=1, dp=8`** (throughput-max, but the 65 GB-per-replica
+budget caps `max_model_len` at ~65k) and **`tp=4, dp=2`** (splits each
+replica over 4 GPUs, which quarters the weight + KV-per-seq cost and
+lets `max_model_len=262144` fit alongside 2 replicas). The wrapper script
+defaults to the second because it's the only configuration that covers
+Qwen3.5-9B's **native** 262 144-token context on 8 H100s.
 
 #### Combining tensor parallel with data parallel
 
@@ -89,21 +97,21 @@ vLLM requires `num_key_value_heads % tensor_parallel_size == 0`. Qwen3.5-9B
 has `num_key_value_heads=4`, so only **tp ∈ {1, 2, 4}** is legal. On your
 8-GPU box that leaves three combinations:
 
-| `tp` | `dp` | Replicas × shards | What it's good for |
-| --- | --- | --- | --- |
-| `1` | `8` | 8 × 1 | **Recommended for SWE-bench.** Max throughput, no per-token cross-GPU comms. |
-| `2` | `4` | 4 × 2 | Lower per-request latency, ~half the throughput of tp=1. Pick if you want to shave wall-clock on individual long generations. |
-| `4` | `2` | 2 × 4 | Even lower latency, ~¼ throughput. Rarely the right trade on SWE-bench. |
-| `8` | `1` | rejected | vLLM refuses: 4 is not divisible by 8. `serve_model.py` catches this up front. |
+| `tp` | `dp` | Replicas × shards | Max practical `max_model_len` on 8×H100 | What it's good for |
+| --- | --- | --- | --- | --- |
+| `1` | `8` | 8 × 1 | ~65k | Throughput-max. 8 replicas run in parallel but each one must hold the full weight + KV in a single 80 GB GPU, so context is capped where KV cache + weights first exceed ~65 GB (bf16). Skips ~7 % of SWE-bench_oracle that need bigger prompts. |
+| `2` | `4` | 4 × 2 | ~131k | Balanced middle. Weights are halved per GPU; KV per full seq is halved too. Good if you want 4 replicas at double the context of tp=1. |
+| `4` | `2` | 2 × 4 | **262k (native)** | **Shipped default.** Weights + KV are /4 per GPU, which is exactly what lets Qwen3.5-9B's native 262144-token context fit. Skips ~0.8 % of SWE-bench_oracle (essentially "impossible" instances that exceed even the native window). |
+| `8` | `1` | rejected | — | vLLM refuses: `num_key_value_heads=4` is not divisible by 8. `serve_model.py` catches this up front with a helpful error listing the legal tps. |
 
 `distributed/serve_model.py` pre-reads the model's `config.json` and will
 exit with a friendly error (not a vLLM traceback) if you request an
 illegal `tp`, if `--max_model_len` exceeds the model's native window, or
 if you set `tp * dp * pp` higher than `CUDA_VISIBLE_DEVICES`. It also
 prints a warning if the chosen `--max_model_len` implies a KV cache so
-large per replica (>25 GiB/sequence) that concurrency will collapse — in
-practice that means you should use 65536 for SWE-bench_Lite_oracle on
-Qwen3.5-9B, not the native 262144.
+large *per GPU* (>25 GiB/sequence after tp-sharding) that concurrency
+will collapse. With the shipped `tp=4, dp=2` setting that figure is
+~8 GiB/GPU/seq at 262k, well below the warning threshold.
 
 Sanity-check the server from the GPU host:
 
@@ -192,10 +200,14 @@ Arguments:
 - `--base_url` – OpenAI v1 base URL of the GPU server.
 - `--api_key` – any non-empty string (vLLM accepts `EMPTY`).
 - `--concurrency` – maximum number of in-flight generation requests
-  (default `8`). **Set this equal to the GPU server's
-  `--data_parallel_size`.** `1` reproduces the old sequential
-  behaviour; a value larger than the number of replicas just spends
-  client memory buffering requests that vLLM will queue internally.
+  (default `8`). A reasonable starting point is `≥ --data_parallel_size`
+  on the GPU server; vLLM's continuous batching inside each replica can
+  typically absorb 2–4× more in-flight requests before KV-cache
+  eviction starts to hurt, so 8 is a good default for
+  `tp=4, dp=2` (where the replica count alone would only be 2) and is
+  already replica-saturating for `tp=1, dp=8`. `1` reproduces the old
+  sequential behaviour; going much higher than 4× replicas just spends
+  client memory buffering requests vLLM will queue internally.
 - `--max_new_tokens` – **upper bound** for completion length (default 200,
   matches `run_llama.py`). The client further clips this to whatever the
   context window can still spare, so the request never exceeds
@@ -230,6 +242,12 @@ Arguments:
   Recommended for Qwen3.5 Instruct so that the model's chat template is
   applied; omit for base models or when your dataset already contains the
   full formatted prompt.
+- `--verbose_skips` – restore per-instance `WARNING` messages for prompts
+  that don't fit the context window. Off by default (those skips are a
+  fixed property of the dataset × server `max_model_len` and would
+  otherwise flood the log with ~150 lines). The running count is always
+  visible on the tqdm postfix as `skipped=N`, and a single summary line
+  with the total + percentage is printed at the end of the run.
 
 ### 2.2.1 Scaling throughput
 
@@ -287,6 +305,16 @@ python -m swebench.harness.run_evaluation \
 - **Timeouts on large contexts** – raise `--request_timeout` on the client
   and `--max-model-len` on the server. The vLLM default may not cover
   the full SWE-bench-oracle prompts (often 20k+ tokens).
+- **"prompt uses N tokens which leaves no room in the M-token window …
+  skipping."** – this is *not* an error, just the client filtering out
+  instances whose oracle-retrieved prompt is larger than the server's
+  `max_model_len`. Expect roughly **7 %** of SWE-bench_oracle at 65k
+  and **3 %** at 131k (measured empirically). To recover them either
+  (a) bump `--max_model_len` on the GPU (doubles the per-token KV cache,
+  so monitor `nvidia-smi`), (b) switch to a tighter retrieval variant
+  such as `SWE-bench_bm25_13K`, or (c) accept the loss — the harness
+  still scores the run, it just can't credit the skipped instances.
+  Use `--verbose_skips` to see which `instance_id`s were filtered.
 - **The model keeps spitting out junk after the patch** – the client
   applies the same stop-on-repeating-token criterion as `run_llama.py`
   (via `--repeat_stop_window` / `--repeat_stop_unique`). Tune those

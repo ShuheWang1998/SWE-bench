@@ -31,8 +31,11 @@ TOKENIZER="/mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B"
 MAX_NEW_TOKENS="0"
 # vLLM's ``--data_parallel_size`` (on the GPU box) is the ceiling on how
 # many requests this client should have in flight at once: more doesn't
-# help, less leaves replicas idle. Matching the two here gives linear
-# scaling to the replica count.
+# help, less leaves replicas idle. The server is currently tp=4 dp=2, so
+# 2 is the natural replica-matched value. vLLM's continuous batching
+# inside each replica can absorb several more in-flight requests though,
+# so we set the client slightly higher (4x replicas) to keep both boxes
+# fully pipelined without starving KV cache.
 CONCURRENCY="8"
 
 # --- Tokenizer fallback ----------------------------------------------------

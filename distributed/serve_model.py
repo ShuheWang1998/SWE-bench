@@ -230,12 +230,15 @@ def _preflight_checks(args: argparse.Namespace, tp: int, dp: int, pp: int) -> No
 
     kv_heads = cfg.get("num_key_value_heads") or cfg.get("num_attention_heads")
     if isinstance(kv_heads, int) and tp > 1 and kv_heads % tp != 0:
+        legal = sorted(d for d in range(1, kv_heads + 1) if kv_heads % d == 0)
         raise SystemExit(
             f"--tensor_parallel_size={tp} is not valid for this model: "
             f"num_key_value_heads={kv_heads} is not divisible by {tp}. "
-            f"Legal values of tp for this model are "
-            f"{sorted(d for d in range(1, kv_heads + 1) if kv_heads % d == 0)}. "
-            "Hint: for 8 GPUs, the usual SWE-bench setting is tp=1, dp=8."
+            f"Legal values of tp for this model are {legal}. "
+            f"Hint: for 8 GPUs on a {kv_heads}-kv-head model, the typical "
+            f"layouts are tp=1*dp=8 (throughput-optimal for short contexts), "
+            f"tp=2*dp=4 (balanced), or tp={max(legal)}*dp={8 // max(legal)} "
+            f"(required for very large max_model_len)."
         )
 
     model_max = cfg.get("max_position_embeddings")
@@ -252,17 +255,21 @@ def _preflight_checks(args: argparse.Namespace, tp: int, dp: int, pp: int) -> No
     gib_per_tok = _kv_gib_per_token(cfg)
     if gib_per_tok is not None and args.max_model_len is not None:
         per_seq_gib = gib_per_tok * args.max_model_len
-        # Warn (not fail) when the declared window would swallow more than
-        # ~25 GiB per replica -- at that point you get ~2-3 concurrent
-        # sequences per GPU on an 80GB card and throughput collapses.
-        if per_seq_gib > 25:
+        # tp shards the KV cache across the tp group, so per-GPU KV is
+        # (full KV / tp). Warn based on what each GPU actually pays, not
+        # the aggregate across the replica -- otherwise e.g. tp=4 at 256k
+        # looks scary (32 GiB "per replica") while each GPU only carries
+        # 8 GiB, which is fine on an 80 GB H100.
+        per_gpu_gib = per_seq_gib / max(1, tp)
+        if per_gpu_gib > 25:
             print(
                 f"[serve_model] warning: max_model_len={args.max_model_len} "
-                f"implies a KV cache of ~{per_seq_gib:.1f} GiB per sequence "
-                f"per replica (bf16). On an 80 GB GPU you will only fit a "
-                f"handful of concurrent sequences per replica, which hurts "
-                f"throughput. SWE-bench_Lite_oracle prompts fit in 64k; "
-                f"consider lowering --max_model_len.",
+                f"implies a KV cache of ~{per_gpu_gib:.1f} GiB per sequence "
+                f"per GPU (bf16, tp={tp}; full-replica KV = {per_seq_gib:.1f} "
+                f"GiB). On an 80 GB GPU you will only fit a handful of "
+                f"concurrent sequences per replica, which hurts throughput. "
+                f"Consider raising tp, lowering --max_model_len, or "
+                f"switching to a tighter retrieval variant.",
                 file=sys.stderr,
             )
 

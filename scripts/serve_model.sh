@@ -13,10 +13,21 @@ MODEL_PATH="/mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B"
 SERVED_MODEL_NAME="Qwen3.5-9B"
 HOST="0.0.0.0"
 PORT="8000"
-TENSOR_PARALLEL_SIZE="1"
-DATA_PARALLEL_SIZE="8"
-GPU_MEMORY_UTILIZATION="0.9"
-MAX_MODEL_LEN="65536"
+# Qwen3.5-9B has 4 KV heads, so vLLM constrains tp to {1, 2, 4}. With 8
+# H100s the best "max-tp" topology is therefore tp=4 * dp=2: two replicas
+# each sharded across 4 GPUs, which covers all 8 devices and splits
+# weights+KV cache by 4 per GPU. That in turn makes the model's native
+# 262144-token context window fit without sacrificing throughput.
+TENSOR_PARALLEL_SIZE="4"
+DATA_PARALLEL_SIZE="2"
+# Native max for Qwen3.5-9B (config.json max_position_embeddings).
+# KV cache ~32 GiB/seq at this ctx, but /4 after tp=4 sharding -> ~8 GiB
+# per GPU per full seq, which fits alongside the ~4.5 GiB sharded weights.
+MAX_MODEL_LEN="262144"
+# tp=4 leaves generous headroom per GPU; push utilization up so we have
+# the KV-cache budget to keep both replicas busy even when prompts are
+# deep into the 262k window.
+GPU_MEMORY_UTILIZATION="0.95"
 DTYPE="bfloat16"
 
 

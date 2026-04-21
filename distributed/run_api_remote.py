@@ -308,6 +308,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "for Instruct models so the server applies its chat template."
         ),
     )
+    parser.add_argument(
+        "--verbose_skips",
+        action="store_true",
+        help=(
+            "By default the client logs one line per *skipped* instance at "
+            "DEBUG level (i.e. hidden) and only prints a final total. Pass "
+            "this to restore per-instance WARNINGs when diagnosing which "
+            "prompts are too long."
+        ),
+    )
 
     parser.add_argument(
         "--max_context_tokens",
@@ -963,9 +973,20 @@ def run(args: argparse.Namespace) -> int:
     )
 
     if skipped_too_long:
+        total = len(items)
+        pct = 100.0 * skipped_too_long / total if total else 0.0
         logger.info(
-            "Skipped %d instance(s) whose prompt exceeded the context window.",
+            "Skipped %d/%d instance(s) (%.1f%%) because their prompt > the "
+            "%d-token context window. This is a dataset/model-size mismatch: "
+            "raise --max_model_len on the server (at the cost of KV-cache "
+            "memory) or switch to a tighter retrieval variant (e.g. "
+            "SWE-bench_bm25_13K instead of SWE-bench_oracle) to recover "
+            "them. Pass --verbose_skips to see which instance_ids were "
+            "skipped.",
             skipped_too_long,
+            total,
+            pct,
+            effective_max_len or 0,
         )
     logger.info("Done. %d prediction(s) written to %s", sent, output_path)
     return 0
@@ -1069,7 +1090,16 @@ async def _run_workers(
         if max_tokens is None:
             async with stats_lock:
                 skipped_too_long += 1
-            logger.warning(
+                skipped_now = skipped_too_long
+                inflight_now = stats["inflight"]
+            # These skips are a fixed property of the dataset vs. the
+            # server's max_model_len (~7% for SWE-bench_oracle at 65k); a
+            # per-instance WARNING drowns the log without telling the
+            # operator anything actionable. Emit at DEBUG by default,
+            # restore WARNING via ``--verbose_skips``, and expose the
+            # running total on the tqdm postfix so it's still visible.
+            logger.log(
+                logging.WARNING if args.verbose_skips else logging.DEBUG,
                 "[%s] prompt uses %d tokens which leaves no room in the "
                 "%d-token window after a %d-token safety margin; skipping.",
                 instance_id,
@@ -1078,6 +1108,10 @@ async def _run_workers(
                 cfg.context_safety_margin,
             )
             pbar.update(1)
+            pbar.set_postfix_str(
+                f"inflight={inflight_now}/{concurrency} skipped={skipped_now}",
+                refresh=False,
+            )
             return
 
         if (
@@ -1126,6 +1160,7 @@ async def _run_workers(
             stats["sent"] += 1
             stats["inflight"] -= 1
             inflight_now = stats["inflight"]
+            skipped_now = skipped_too_long
 
         trimmed = truncate_on_repeat(
             raw,
@@ -1143,7 +1178,7 @@ async def _run_workers(
         elapsed = time.time() - start
         pbar.update(1)
         pbar.set_postfix_str(
-            f"inflight={inflight_now}/{concurrency}",
+            f"inflight={inflight_now}/{concurrency} skipped={skipped_now}",
             refresh=False,
         )
         logger.info(

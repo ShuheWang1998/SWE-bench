@@ -35,27 +35,36 @@ Install the GPU-side dependencies (Python 3.10+, CUDA-enabled PyTorch + vLLM):
 pip install -r distributed/requirements-gpu.txt
 ```
 
-Launch the server (listens on port `8000` by default; bind to
-`0.0.0.0` so the CPU machine can connect):
+Launch the server(s). The shipped wrapper launches **two independent
+vLLM processes** — one tp=4 replica on GPUs 0–3 listening on `:8000`
+and another tp=4 replica on GPUs 4–7 listening on `:8001`:
 
 ```bash
-bash distributed/serve_model.sh \
-    /mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B \
-    0.0.0.0 8000
+bash scripts/serve_model.sh
 ```
 
-Or call the Python entry-point directly for more control:
+Or call the Python entry-point directly per replica (for example, to
+pick a different port layout):
 
 ```bash
-python -m distributed.serve_model \
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m distributed.serve_model \
     --model_path /mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B \
     --served_model_name Qwen3.5-9B \
-    --host 0.0.0.0 \
-    --port 8000 \
+    --host 0.0.0.0 --port 8000 \
     --gpu_memory_utilization 0.95 \
     --max_model_len 262144 \
     --tensor_parallel_size 4 \
-    --data_parallel_size 2
+    --data_parallel_size 1 &
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 python -m distributed.serve_model \
+    --model_path /mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B \
+    --served_model_name Qwen3.5-9B \
+    --host 0.0.0.0 --port 8001 \
+    --gpu_memory_utilization 0.95 \
+    --max_model_len 262144 \
+    --tensor_parallel_size 4 \
+    --data_parallel_size 1 &
+wait
 ```
 
 > **Pick `--max_model_len` large enough for the prompts you'll send.** It
@@ -63,60 +72,80 @@ python -m distributed.serve_model \
 > rejects any request where `prompt_tokens + max_tokens > max_model_len`.
 > SWE-bench_oracle prompts regularly run 20k–35k tokens with a long tail
 > that goes well past 100k. **The wrapper script ships with
-> `tp=4, dp=2, max_model_len=262144`** so Qwen3.5-9B on 8×H100 fits the
-> model's native 262144-token window (recovers ~7 % of instances that
-> would otherwise be skipped at 65k). If you prefer lower per-request
-> latency and don't need the huge context, drop to
-> `tp=1, dp=8, max_model_len=65536` (the upstream default).
+> two tp=4 replicas at `max_model_len=262144`** so Qwen3.5-9B on
+> 8×H100 fits the model's native 262 144-token window (recovers ~7 % of
+> instances that would otherwise be skipped at 65k). If you prefer lower
+> per-request latency and don't need the huge context, drop to **eight
+> tp=1 replicas** at `max_model_len=65536` (one replica per GPU,
+> throughput-max but ~7% of SWE-bench_oracle skipped).
 
 ### Choosing the parallelism strategy
 
-`distributed/serve_model.py` forwards three knobs to vLLM:
+`distributed/serve_model.py` exposes the following vLLM knobs, and each
+**replica** is launched as a separate process:
 
 | Flag | What it does | When to use it |
 | --- | --- | --- |
-| `--tensor_parallel_size N` (`-tp`) | Shards a *single* model across `N` GPUs. Requires `num_key_value_heads % N == 0`. | Only when one model copy does not fit on one GPU. Lowers latency but adds cross-GPU comms per token. |
-| `--data_parallel_size N` (`-dp`) | Runs `N` full replicas of the model inside one server, load-balances requests. | **Default choice for SWE-bench.** Batch-of-independent-prompts workload, no inter-GPU sync per token, linear throughput scaling. |
+| `--tensor_parallel_size N` (`-tp`) | Shards a *single* model across `N` GPUs. Requires `num_key_value_heads % N == 0`. | Only when one model copy does not fit on one GPU, or when you want the larger KV-cache budget that per-GPU sharding buys. Lowers per-request latency but adds cross-GPU comms per token. |
+| `--data_parallel_size N` (`-dp`) | Runs `N` replicas of the model inside a single server, sharing one API port. | **Avoid for non-MoE models like Qwen3.5-9B.** See the warning below — use per-replica processes and client-side load-balancing instead. |
 | `--pipeline_parallel_size N` (`-pp`) | Splits layers across `N` GPUs. | Very large models only. Leave at 1 at the 9B scale. |
 
-Total GPUs consumed = `tp × dp × pp`. The wrapper refuses to launch if that
-exceeds `CUDA_VISIBLE_DEVICES` (or the system's GPU count).
+**Important — why we launch two processes instead of one server with
+`-dp 2`.** vLLM's internal DP load-balancer in the 0.19 series reports
+per-replica load to the dispatcher via a coordinator that only refreshes
+every ~100 ms. For Qwen3.5-9B (non-MoE) on H100s, most requests complete
+well inside that window, so the dispatcher sees every replica as "empty"
+and repeatedly picks rank 0 — the result is **one replica pinned at
+~97 % and the other idle at ~0 %** (nvidia-smi-confirmed, matches
+vllm-project/vllm#39384). The upstream docs recommend *external*
+load-balancing for non-MoE deployments, which is exactly what we do:
+`scripts/serve_model.sh` launches one fully independent `vllm serve`
+per replica (no DP flags) and the Python client alternates between them
+with a least-in-flight scheduler.
+
+Total GPUs consumed = `tp × (# replicas)`. The wrapper refuses to launch
+if that exceeds the box's GPU count.
 
 For `Qwen3.5-9B` (≈18 GB bf16 — fits comfortably on any H100 with room for
 KV cache) on an 8×H100 node, the two interesting points in the design
-space are **`tp=1, dp=8`** (throughput-max, but the 65 GB-per-replica
-budget caps `max_model_len` at ~65k) and **`tp=4, dp=2`** (splits each
-replica over 4 GPUs, which quarters the weight + KV-per-seq cost and
-lets `max_model_len=262144` fit alongside 2 replicas). The wrapper script
-defaults to the second because it's the only configuration that covers
-Qwen3.5-9B's **native** 262 144-token context on 8 H100s.
+space are **8 × tp=1 replicas** (throughput-max, but the 65 GB-per-GPU
+budget caps `max_model_len` at ~65k) and **2 × tp=4 replicas** (shards
+each replica over 4 GPUs, which quarters the weight + KV-per-seq cost
+and lets `max_model_len=262144` fit alongside 2 replicas). The wrapper
+script defaults to the second because it's the only configuration that
+covers Qwen3.5-9B's **native** 262 144-token context on 8 H100s.
 
-#### Combining tensor parallel with data parallel
+#### Layouts you might deploy
 
 vLLM requires `num_key_value_heads % tensor_parallel_size == 0`. Qwen3.5-9B
 has `num_key_value_heads=4`, so only **tp ∈ {1, 2, 4}** is legal. On your
-8-GPU box that leaves three combinations:
+8-GPU box that gives three practical layouts:
 
-| `tp` | `dp` | Replicas × shards | Max practical `max_model_len` on 8×H100 | What it's good for |
+| `tp` | # replicas | Ports | Max practical `max_model_len` | What it's good for |
 | --- | --- | --- | --- | --- |
-| `1` | `8` | 8 × 1 | ~65k | Throughput-max. 8 replicas run in parallel but each one must hold the full weight + KV in a single 80 GB GPU, so context is capped where KV cache + weights first exceed ~65 GB (bf16). Skips ~7 % of SWE-bench_oracle that need bigger prompts. |
-| `2` | `4` | 4 × 2 | ~131k | Balanced middle. Weights are halved per GPU; KV per full seq is halved too. Good if you want 4 replicas at double the context of tp=1. |
-| `4` | `2` | 2 × 4 | **262k (native)** | **Shipped default.** Weights + KV are /4 per GPU, which is exactly what lets Qwen3.5-9B's native 262144-token context fit. Skips ~0.8 % of SWE-bench_oracle (essentially "impossible" instances that exceed even the native window). |
-| `8` | `1` | rejected | — | vLLM refuses: `num_key_value_heads=4` is not divisible by 8. `serve_model.py` catches this up front with a helpful error listing the legal tps. |
+| `1` | `8` | 8000–8007 | ~65k | Throughput-max. 8 replicas run in parallel but each one must hold the full weight + KV in a single 80 GB GPU, so context is capped where KV cache + weights first exceed ~65 GB (bf16). Skips ~7 % of SWE-bench_oracle that need bigger prompts. |
+| `2` | `4` | 8000–8003 | ~131k | Balanced middle. Weights are halved per GPU; KV per full seq is halved too. Good if you want 4 replicas at double the context of tp=1. |
+| `4` | `2` | 8000, 8001 | **262k (native)** | **Shipped default.** Weights + KV are /4 per GPU, which is exactly what lets Qwen3.5-9B's native 262 144-token context fit. Skips ~0.8 % of SWE-bench_oracle (essentially "impossible" instances that exceed even the native window). |
+| `8` | `1` | 8000 | — | vLLM refuses: `num_key_value_heads=4` is not divisible by 8. `serve_model.py` catches this up front with a helpful error listing the legal tps. |
+
+Whichever layout you pick, pass every replica's `/v1` base URL to the
+client as a comma-separated list (see `--base_url` below) and it will
+balance requests across all of them.
 
 `distributed/serve_model.py` pre-reads the model's `config.json` and will
 exit with a friendly error (not a vLLM traceback) if you request an
 illegal `tp`, if `--max_model_len` exceeds the model's native window, or
-if you set `tp * dp * pp` higher than `CUDA_VISIBLE_DEVICES`. It also
-prints a warning if the chosen `--max_model_len` implies a KV cache so
-large *per GPU* (>25 GiB/sequence after tp-sharding) that concurrency
-will collapse. With the shipped `tp=4, dp=2` setting that figure is
-~8 GiB/GPU/seq at 262k, well below the warning threshold.
+if the chosen layout exceeds `CUDA_VISIBLE_DEVICES`. It also prints a
+warning if the chosen `--max_model_len` implies a KV cache so large *per
+GPU* (>25 GiB/sequence after tp-sharding) that concurrency will
+collapse. With the shipped `tp=4` setting that figure is ~8 GiB/GPU/seq
+at 262k, well below the warning threshold.
 
-Sanity-check the server from the GPU host:
+Sanity-check both servers from the GPU host:
 
 ```bash
 curl http://localhost:8000/v1/models
+curl http://localhost:8001/v1/models
 ```
 
 Make sure the `host:port` is reachable from the CPU host (`telnet <gpu-ip> 8000`).
@@ -128,6 +157,10 @@ For a one-shot end-to-end check from the CPU host once the server is up:
 ```bash
 python -m distributed.check_connection \
     --base_url http://<gpu-host-or-tunnel>:8000/v1 \
+    --model Qwen3.5-9B
+# and the second replica:
+python -m distributed.check_connection \
+    --base_url http://<gpu-host-or-tunnel>:8001/v1 \
     --model Qwen3.5-9B
 ```
 
@@ -178,7 +211,7 @@ python -m distributed.run_api_remote \
     --dataset_name_or_path princeton-nlp/SWE-bench_Lite_oracle \
     --split test \
     --model_name_or_path Qwen3.5-9B \
-    --base_url http://<gpu-host-or-tunnel>:8000/v1 \
+    --base_url http://<gpu-host-or-tunnel>:8000/v1,http://<gpu-host-or-tunnel>:8001/v1 \
     --api_key EMPTY \
     --output_dir ./outputs \
     --temperature 0.0 \
@@ -197,17 +230,24 @@ Arguments:
 - `--model_name_or_path` – the string you want to appear in the predictions
   file and logs. Should match the `--served-model-name` used on the GPU host
   so the request is routed correctly.
-- `--base_url` – OpenAI v1 base URL of the GPU server.
-- `--api_key` – any non-empty string (vLLM accepts `EMPTY`).
-- `--concurrency` – maximum number of in-flight generation requests
-  (default `8`). A reasonable starting point is `≥ --data_parallel_size`
-  on the GPU server; vLLM's continuous batching inside each replica can
-  typically absorb 2–4× more in-flight requests before KV-cache
-  eviction starts to hurt, so 8 is a good default for
-  `tp=4, dp=2` (where the replica count alone would only be 2) and is
-  already replica-saturating for `tp=1, dp=8`. `1` reproduces the old
-  sequential behaviour; going much higher than 4× replicas just spends
-  client memory buffering requests vLLM will queue internally.
+- `--base_url` – OpenAI v1 base URL of the GPU server. **Accepts a
+  comma-separated list** when you run more than one replica (recommended
+  for non-MoE models, see §1). The client opens one connection pool per
+  URL and dispatches each request to the backend with the lowest
+  in-flight count, breaking ties with round-robin so it alternates
+  `A→B→A→B…` instead of serializing on one replica. On startup we
+  probe `max_model_len` on *every* backend and refuse to run if they
+  disagree.
+- `--api_key` – any non-empty string (vLLM accepts `EMPTY`). The same
+  key is sent to every backend.
+- `--concurrency` – maximum number of *total* in-flight generation
+  requests across all backends (default `8`). The client splits this
+  budget evenly: with `8` concurrency and `2` backends, each replica
+  sees up to 4 concurrent requests, which is enough to keep vLLM's
+  continuous batching fed without waiting for KV cache churn. Rule of
+  thumb: `replicas × 4` is a safe ceiling on H100s. `1` reproduces the
+  old sequential behaviour; going much higher than `replicas × 8` just
+  spends client memory buffering requests vLLM will queue internally.
 - `--max_new_tokens` – **upper bound** for completion length (default 200,
   matches `run_llama.py`). The client further clips this to whatever the
   context window can still spare, so the request never exceeds
@@ -252,7 +292,8 @@ Arguments:
 ### 2.2.1 Scaling throughput
 
 The client is async and maintains up to `--concurrency` in-flight
-requests. If your GPU server runs with `--data_parallel_size 8`, the
+requests, split evenly across every URL you pass to `--base_url`. If
+your GPU server runs with 2 tp=4 replicas (the shipped default), the
 benchmark below shows the speedup you should see out of the box:
 
 | Client `--concurrency` | Wall-clock for 16 instances (Qwen3.5-9B, `--max_new_tokens 200`) | Throughput |
@@ -260,12 +301,14 @@ benchmark below shows the speedup you should see out of the box:
 | 1 | 23.5 s (1.47 s/it) | 0.68 req/s |
 | 8 | 3.7 s (4.33 it/s) | 4.33 req/s (**6.4×**) |
 
-Scaling past the replica count yields diminishing returns (vLLM's own
+Scaling past `replicas × 4` yields diminishing returns (vLLM's own
 continuous batching inside a replica is already very efficient) and
 eventually *hurts* throughput once KV-cache pressure forces evictions.
-Start at `--concurrency == --data_parallel_size` and only go higher if
-the progress bar's `inflight=N/K` indicator is consistently pinned at
-`K` and the GPUs aren't saturated.
+The tqdm progress bar shows `per-backend=[a,b,…]` live: if those
+numbers track each other closely (e.g. `[3,3]` or `[4,4]`) the
+dispatch is healthy; if one number stays at `0` while another stays
+pinned at the per-backend budget, a backend is down or your tunnel is
+only pointed at one replica.
 
 The output is a standard SWE-bench predictions JSONL with three keys per line:
 
@@ -321,4 +364,19 @@ python -m swebench.harness.run_evaluation \
   values or tighten `--max_new_tokens`.
 - **OOM on the GPU** – reduce `--gpu_memory_utilization`, lower
   `--max_model_len`, or shard across GPUs with `--tensor_parallel_size N`.
+- **One replica pinned at ~97 %, other(s) idle at ~0 %** – this is the
+  symptom of vLLM's internal DP load balancer getting stuck on rank 0
+  for non-MoE models on fast GPUs (vllm-project/vllm#39384). The fix is
+  already the shipped default: run each replica as its own `vllm serve`
+  process (no `--data-parallel-size` flag) and let the client do
+  HTTP-layer least-in-flight routing by passing both URLs to
+  `--base_url`. If you're seeing this, double-check that
+  `scripts/serve_model.sh` actually launched *two* processes (look for
+  two listening ports: `ss -tlnp | grep -E '800[01]'`) and that the
+  client's `--base_url` has both URLs comma-separated, not just one.
+- **Client hits "Backends disagree on max_model_len"** – one replica
+  was launched with a different `--max_model_len`. Re-check
+  `scripts/serve_model.sh` is the same on all processes, or pass
+  `--server_max_model_len N` to the client to override (N will be
+  applied to every backend; requests larger than that are skipped).
 

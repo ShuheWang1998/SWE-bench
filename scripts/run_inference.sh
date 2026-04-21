@@ -20,7 +20,15 @@ find "$(dirname "$0")/../distributed" -type d -name __pycache__ -prune -print0 2
 DATASET_NAME_OR_PATH="princeton-nlp/SWE-bench_oracle"
 SPLIT="test"
 MODEL_NAME_OR_PATH="Qwen3.5-9B"
-BASE_URL="http://localhost:40220/v1"
+# Two independent vLLM replicas (tp=4 each) launched by scripts/serve_model.sh.
+# Pass both URLs as a comma-separated list; the client picks whichever backend
+# has the fewest in-flight requests and breaks ties with round-robin so it
+# alternates send/receive between them instead of serializing on one replica.
+# Replace localhost:40220/40221 with the tunnel ports you use to reach the
+# GPU box (the example below assumes two SSH tunnels on those ports; if you
+# run the client on the GPU box directly, use http://localhost:8000/v1 and
+# http://localhost:8001/v1 to match scripts/serve_model.sh).
+BASE_URL="http://localhost:40220/v1,http://localhost:40221/v1"
 OUTPUT_DIR="/home/wangshuhe/results/swe_qwen35_9b_outputs"
 TOKENIZER="/mgfs/shared/Group_GY/wenchao/shhh/models/Qwen3.5-9B"
 # Upstream swebench.inference.run_llama.py uses 200 as the default output
@@ -36,7 +44,7 @@ MAX_NEW_TOKENS="0"
 # inside each replica can absorb several more in-flight requests though,
 # so we set the client slightly higher (4x replicas) to keep both boxes
 # fully pipelined without starving KV cache.
-CONCURRENCY="8"
+CONCURRENCY="2"
 
 # --- Tokenizer fallback ----------------------------------------------------
 # Some CPU hosts cannot see the full GPU-side model directory (e.g. only

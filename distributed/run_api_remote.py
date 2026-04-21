@@ -175,9 +175,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Base URL of the OpenAI-compatible server, e.g. "
-            "'http://gpu-host:8000/v1'. Falls back to the env var "
-            "``SWEBENCH_REMOTE_BASE_URL`` if not set."
+            "Base URL(s) of the OpenAI-compatible server(s). A single "
+            "value targets one backend, e.g. 'http://gpu-host:8000/v1'. "
+            "Pass a comma-separated list (e.g. "
+            "'http://gpu-host:8000/v1,http://gpu-host:8001/v1') to fan "
+            "out across multiple independent replicas; requests are "
+            "distributed with least-in-flight routing so both replicas "
+            "stay busy without waiting for a stats-update tick. Falls "
+            "back to the env var ``SWEBENCH_REMOTE_BASE_URL`` if not set."
         ),
     )
     parser.add_argument(
@@ -369,17 +374,59 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # --------------------------------------------------------------------------- #
 
 
-def resolve_client(base_url: str | None, api_key: str | None, timeout: float) -> openai.OpenAI:
-    base_url = base_url or os.environ.get("SWEBENCH_REMOTE_BASE_URL")
-    if not base_url:
+def parse_base_urls(base_url_arg: str | None) -> list[str]:
+    """Parse ``--base_url`` into a list of backend endpoints.
+
+    Accepts either a single URL (``http://h:8000/v1``) or a
+    comma-separated list (``http://h:8000/v1,http://h:8001/v1``) and
+    also falls back to the ``SWEBENCH_REMOTE_BASE_URL`` env var.
+
+    The returned list preserves input order, is de-duplicated (handy when
+    the same endpoint is passed twice accidentally), and strips
+    surrounding whitespace on each entry. It never contains an empty
+    string; if no URL could be determined we raise a ``SystemExit`` with
+    an actionable message rather than silently default to ``None``.
+    """
+    raw = base_url_arg or os.environ.get("SWEBENCH_REMOTE_BASE_URL") or ""
+    items: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw.split(","):
+        v = chunk.strip().rstrip("/")
+        if not v:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        items.append(v)
+    if not items:
         raise SystemExit(
             "No --base_url provided and SWEBENCH_REMOTE_BASE_URL is unset. "
-            "Set one to the address of the GPU server (e.g. "
-            "'http://gpu-host:8000/v1')."
+            "Set one (or a comma-separated list) to the address of the GPU "
+            "server(s), e.g. 'http://gpu-host:8000/v1' or "
+            "'http://gpu-host:8000/v1,http://gpu-host:8001/v1'."
         )
+    return items
+
+
+def resolve_client(
+    base_url: str | None,
+    api_key: str | None,
+    timeout: float,
+) -> openai.OpenAI:
+    """Build a *synchronous* OpenAI client for the first backend.
+
+    We only use this client for startup probes (``/v1/models`` and the
+    tokenizer calibration round-trip). At runtime every worker uses an
+    ``AsyncOpenAI`` instance built per-backend in ``_run_workers``.
+    """
+    urls = parse_base_urls(base_url)
     key = api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
-    logger.info("Connecting to %s", base_url)
-    return openai.OpenAI(base_url=base_url, api_key=key, timeout=timeout)
+    logger.info(
+        "Connecting to %d backend(s): %s",
+        len(urls),
+        ", ".join(urls),
+    )
+    return openai.OpenAI(base_url=urls[0], api_key=key, timeout=timeout)
 
 
 def query_server_max_model_len(client: openai.OpenAI, model: str) -> int | None:
@@ -891,21 +938,61 @@ def run(args: argparse.Namespace) -> int:
         chat=args.chat,
         context_safety_margin=args.context_safety_margin,
     )
-    client = resolve_client(args.base_url, args.api_key, cfg.request_timeout)
+    base_urls = parse_base_urls(args.base_url)
+    api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
+    logger.info(
+        "Connecting to %d backend(s): %s",
+        len(base_urls),
+        ", ".join(base_urls),
+    )
 
-    # Ask the server (or the user) for the hard context ceiling.
+    # Probe each backend independently for max_model_len. We refuse to
+    # continue if different backends disagree, because the dynamic
+    # budget logic assumes a single ceiling applies to every request:
+    # if one replica is configured at 64k and another at 256k, a prompt
+    # sized to the larger would 400 on the smaller.
     server_max_len = args.server_max_model_len
+    reported: dict[str, int | None] = {}
     if server_max_len is None:
-        server_max_len = query_server_max_model_len(client, args.model_name_or_path)
+        for url in base_urls:
+            probe = openai.OpenAI(
+                base_url=url, api_key=api_key, timeout=cfg.request_timeout
+            )
+            try:
+                reported[url] = query_server_max_model_len(
+                    probe, args.model_name_or_path
+                )
+            finally:
+                probe.close()
+        distinct = {v for v in reported.values() if v is not None}
+        if len(distinct) > 1:
+            raise SystemExit(
+                "Backends disagree on max_model_len: "
+                + ", ".join(f"{k}={v}" for k, v in reported.items())
+                + ". Reconfigure so every backend serves the same "
+                "max_model_len, or pass --server_max_model_len to "
+                "override (in which case the client will use that value "
+                "for *every* backend)."
+            )
+        server_max_len = next(iter(distinct), None)
     if server_max_len is not None:
-        logger.info("Server reports max_model_len=%d for %s.",
-                    server_max_len, args.model_name_or_path)
-    else:
-        logger.warning(
-            "Server did not report max_model_len for %s; dynamic budget "
-            "disabled. Pass --server_max_model_len to re-enable it.",
+        logger.info(
+            "Server(s) report max_model_len=%d for %s.",
+            server_max_len,
             args.model_name_or_path,
         )
+    else:
+        logger.warning(
+            "Server(s) did not report max_model_len for %s; dynamic "
+            "budget disabled. Pass --server_max_model_len to re-enable it.",
+            args.model_name_or_path,
+        )
+
+    # One synchronous client, only used for the tokenizer calibration
+    # below. Workers will construct their own async clients later.
+    client = openai.OpenAI(
+        base_url=base_urls[0], api_key=api_key, timeout=cfg.request_timeout
+    )
 
     # Allow the user to artificially tighten the cap (useful for testing
     # against a server configured with a bigger window than you want to use).
@@ -954,9 +1041,11 @@ def run(args: argparse.Namespace) -> int:
 
     concurrency = max(1, int(args.concurrency))
     logger.info(
-        "Running with concurrency=%d against %s (request_timeout=%.0fs).",
+        "Running with concurrency=%d across %d backend(s): %s "
+        "(request_timeout=%.0fs).",
         concurrency,
-        args.base_url,
+        len(base_urls),
+        ", ".join(base_urls),
         cfg.request_timeout,
     )
 
@@ -969,6 +1058,8 @@ def run(args: argparse.Namespace) -> int:
             effective_max_len=effective_max_len,
             output_path=output_path,
             concurrency=concurrency,
+            base_urls=base_urls,
+            api_key=api_key,
         )
     )
 
@@ -1000,33 +1091,95 @@ async def _run_workers(
     effective_max_len: int | None,
     output_path: Path,
     concurrency: int,
+    base_urls: list[str],
+    api_key: str,
 ) -> tuple[int, int]:
     """Process ``items`` concurrently and append predictions to disk.
 
     Returns ``(skipped_too_long, predictions_written)``.
+
+    Dispatch is done at the HTTP layer: we keep one ``AsyncOpenAI`` per
+    backend URL and route each request to the backend with the fewest
+    in-flight requests right now. That is "external load balancing" in
+    the vLLM sense and is what the upstream DP docs explicitly recommend
+    for non-MoE models. It avoids the single-replica stickiness we hit
+    when using vLLM's internal DP LB with dp=2 on fast H100 hardware
+    (see issue vllm-project/vllm#39384).
     """
-    # Each in-flight request needs its own HTTP slot. We use an
-    # ``AsyncOpenAI`` client; its underlying httpx.AsyncClient pools
-    # connections for us. Size the connection pool to ``concurrency``
-    # so we neither over-allocate sockets nor serialize on a tiny pool.
-    base_url = args.base_url or os.environ.get("SWEBENCH_REMOTE_BASE_URL")
-    api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
     import httpx  # imported locally — httpx is an openai dependency
 
-    transport = httpx.AsyncHTTPTransport(retries=0)
-    http_client = httpx.AsyncClient(
-        limits=httpx.Limits(
-            max_connections=max(concurrency * 2, 16),
-            max_keepalive_connections=max(concurrency, 8),
-        ),
-        timeout=cfg.request_timeout,
-        transport=transport,
-    )
-    aclient = openai.AsyncOpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        http_client=http_client,
-    )
+    # Concurrency budget per backend: split the total concurrency
+    # evenly across backends (rounded up so we never starve any single
+    # one). Each HTTP pool is sized to that budget * 2 so we have
+    # headroom for slightly-racy opens/closes without queueing on
+    # sockets.
+    n_backends = len(base_urls)
+    per_backend_conc = max(1, (concurrency + n_backends - 1) // n_backends)
+
+    class Backend:
+        __slots__ = ("url", "client", "http", "inflight")
+
+        def __init__(self, url: str) -> None:
+            self.url = url
+            self.http = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=max(per_backend_conc * 2, 16),
+                    max_keepalive_connections=max(per_backend_conc, 8),
+                ),
+                timeout=cfg.request_timeout,
+                transport=httpx.AsyncHTTPTransport(retries=0),
+            )
+            self.client = openai.AsyncOpenAI(
+                base_url=url,
+                api_key=api_key,
+                http_client=self.http,
+            )
+            # Number of requests currently in flight against this
+            # backend. Incremented when a request is dispatched,
+            # decremented once the HTTP reply returns (success or fail).
+            self.inflight = 0
+
+    backends: list[Backend] = [Backend(u) for u in base_urls]
+    # Round-robin cursor, used only to break ties in in-flight count.
+    # Critical on cold start: if we just did ``min(backends, key=...)``
+    # when both were at inflight=0, Python's stable min would always
+    # return backends[0] and re-create the "stuck on one replica"
+    # problem we're trying to fix. Instead, when the smallest-inflight
+    # set has more than one backend we advance the cursor and pick
+    # whichever of them is next in rotation.
+    #
+    # Start the cursor at ``len(backends) - 1`` so the first pick sees
+    # ``rr_cursor = 0`` after the pre-increment, meaning the very
+    # first request lands on backends[0], the second on backends[1],
+    # etc. — the smooth A→B→A→B pattern the operator will expect.
+    rr_cursor = len(backends) - 1
+
+    def _pick_backend() -> Backend:
+        """Return a backend using least-in-flight with round-robin ties.
+
+        Behaviour:
+        * If exactly one backend has the smallest ``inflight`` count,
+          pick it (least-loaded wins).
+        * If several tie, pick the next one after ``rr_cursor``, so
+          consecutive "both idle" requests alternate instead of all
+          landing on backend 0.
+
+        This gives you the smooth "send to A, then B, then A, ..." the
+        user observed is missing, with zero idle time between
+        requests and no reliance on a sleepy stats coordinator.
+        """
+        nonlocal rr_cursor
+        min_if = min(b.inflight for b in backends)
+        tied = [i for i, b in enumerate(backends) if b.inflight == min_if]
+        if len(tied) == 1:
+            return backends[tied[0]]
+        # Advance the cursor until we find a tied backend.
+        n = len(backends)
+        for _ in range(n):
+            rr_cursor = (rr_cursor + 1) % n
+            if rr_cursor in tied:
+                return backends[rr_cursor]
+        return backends[tied[0]]
 
     # The writer is a single thread-safe coroutine; workers push payloads
     # onto a queue and the writer drains them in arrival order. This keeps
@@ -1133,11 +1286,19 @@ async def _run_workers(
 
         start = time.time()
         async with sem:
+            # Pick the target backend *inside* the semaphore so we see
+            # up-to-date inflight counts. Updating ``b.inflight`` has
+            # to happen atomically with the pick itself; since all of
+            # these counters are only ever read/written from the main
+            # asyncio event loop (no threads), regular integer arith
+            # is safe without a lock.
             async with stats_lock:
+                backend = _pick_backend()
+                backend.inflight += 1
                 stats["inflight"] += 1
             try:
                 raw = await _remote_generate_async(
-                    aclient,
+                    backend.client,
                     args.model_name_or_path,
                     prompt,
                     cfg,
@@ -1149,9 +1310,15 @@ async def _run_workers(
                     stats["failed"] += 1
                     stats["consecutive_failures"] += 1
                     stats["inflight"] -= 1
+                    backend.inflight -= 1
                     if stats["consecutive_failures"] >= 5:
                         stats["abort"] = True
-                logger.error("Generation failed for %s: %s", instance_id, exc)
+                logger.error(
+                    "Generation failed for %s on %s: %s",
+                    instance_id,
+                    backend.url,
+                    exc,
+                )
                 pbar.update(1)
                 return
 
@@ -1159,6 +1326,7 @@ async def _run_workers(
             stats["consecutive_failures"] = 0
             stats["sent"] += 1
             stats["inflight"] -= 1
+            backend.inflight -= 1
             inflight_now = stats["inflight"]
             skipped_now = skipped_too_long
 
@@ -1177,13 +1345,21 @@ async def _run_workers(
         await queue.put(payload)
         elapsed = time.time() - start
         pbar.update(1)
+        # Per-backend inflight breakdown is the easiest way to see
+        # whether the dispatch is actually alternating. With 2
+        # backends you should usually see something like "1/1" when
+        # busy and "0/0" briefly between waves.
+        per_backend = ",".join(str(b.inflight) for b in backends)
         pbar.set_postfix_str(
-            f"inflight={inflight_now}/{concurrency} skipped={skipped_now}",
+            f"inflight={inflight_now}/{concurrency} "
+            f"per-backend=[{per_backend}] skipped={skipped_now}",
             refresh=False,
         )
         logger.info(
-            "[%s] prompt=%d tok, budget=%d tok, gen=%d chars in %.2fs; patch_bytes=%d",
+            "[%s] backend=%s prompt=%d tok, budget=%d tok, gen=%d chars "
+            "in %.2fs; patch_bytes=%d",
             instance_id,
+            backend.url,
             prompt_tokens,
             max_tokens,
             len(trimmed),
@@ -1198,8 +1374,15 @@ async def _run_workers(
         pbar.close()
         await queue.put(None)
         await writer_task
-        await aclient.close()
-        await http_client.aclose()
+        for b in backends:
+            try:
+                await b.client.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+            try:
+                await b.http.aclose()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
 
     if stats["abort"]:
         logger.error(
